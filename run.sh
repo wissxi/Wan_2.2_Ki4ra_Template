@@ -28,86 +28,113 @@ function section() {
     echo -e "${CYAN}╚══════════════════════════════════════════════════════╝${RESET}"
 }
 
-function log_info()    { echo -e "  ${GREEN}✔${RESET}  $1"; }
-function log_warn()    { echo -e "  ${YELLOW}⚠${RESET}  $1"; }
-function log_skip()    { echo -e "  ${CYAN}↷${RESET}  $1 ${YELLOW}(уже есть, пропускаем)${RESET}"; }
-function log_dl()      { echo -e "  ${CYAN}↓${RESET}  $1"; }
+function log_info()  { echo -e "  ${GREEN}✔${RESET}  $1"; }
+function log_warn()  { echo -e "  ${YELLOW}⚠${RESET}  $1"; }
+function log_skip()  { echo -e "  ${CYAN}↷${RESET}  $1 ${YELLOW}(уже есть, пропускаем)${RESET}"; }
+function log_dl()    { echo -e "  ${CYAN}↓${RESET}  $1"; }
 
-# ─── Модели ───────────────────────────────────────────────────────────────────
+# ─── Скачивание с прогрессбаром (одна строка в секунду, без \r мусора) ────────
+function download_file() {
+    local url="$1"
+    local dest_dir="$2"
+    local auth_header="${3:-}"
 
-CLIP_MODELS=(
-    "https://huggingface.co/f5aiteam/CLIP/resolve/main/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
-)
+    local filename
+    filename=$(basename "$url" | cut -d'?' -f1)
 
-CLIP_VISION_MODELS=(
-    "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors"
-)
+    mkdir -p "$dest_dir"
 
-VAE_MODELS=(
-    "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors"
-)
+    if [[ -f "$dest_dir/$filename" ]]; then
+        log_skip "$filename"
+        return
+    fi
 
-DIFFUSION_MODELS=(
-    "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/diffusion_models/z_image_turbo_bf16.safetensors"
-    "https://huggingface.co/Tongyi-MAI/Z-Image/resolve/main/transformer/diffusion_pytorch_model-00001-of-00002.safetensors"
-    "https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/Wan22Animate/Wan2_2-Animate-14B_fp8_scaled_e4m3fn_KJ_v2.safetensors"
-)
+    log_dl "$filename"
 
-DETECTION_MODELS=(
-    "https://huggingface.co/Wan-AI/Wan2.2-Animate-14B/resolve/main/process_checkpoint/det/yolov10m.onnx"
-    "https://huggingface.co/Kijai/vitpose_comfy/resolve/main/onnx/vitpose_h_wholebody_data.bin"
-    "https://huggingface.co/Kijai/vitpose_comfy/resolve/main/onnx/vitpose_h_wholebody_model.onnx"
-    "https://huggingface.co/wissxi/Wan_2.2_Ki4ra/resolve/main/models/detection/vitpose-l-wholebody.onnx"
-)
+    # Узнаём размер файла через HEAD
+    local head_args=(-L --silent --head --write-out "%{content_length}" --output /dev/null)
+    [[ -n "$auth_header" ]] && head_args+=(-H "$auth_header")
+    local total_size
+    total_size=$(curl "${head_args[@]}" "$url" 2>/dev/null || echo 0)
 
-LORA_MODELS=(
-    "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank256_bf16.safetensors"
-    "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
-    "https://huggingface.co/alibaba-pai/Wan2.2-Fun-Reward-LoRAs/resolve/main/Wan2.2-Fun-A14B-InP-low-noise-HPS2.1.safetensors"
-    "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Pusa/Wan21_PusaV1_LoRA_14B_rank512_bf16.safetensors"
-)
+    # Качаем в фоне
+    local curl_args=(-L --silent --output "$dest_dir/$filename")
+    [[ -n "$auth_header" ]] && curl_args+=(-H "$auth_header")
+    curl "${curl_args[@]}" "$url" &
+    local curl_pid=$!
 
-UPSCALER_MODELS=(
-    "https://huggingface.co/GerbyHorty76/videoloras/resolve/main/4xUltrasharp_4xUltrasharpV10.pt"
-)
+    # Python следит за файлом и печатает прогресс раз в 2 секунды
+    python3 - "$dest_dir/$filename" "$total_size" "$filename" << 'PYEOF'
+import sys, os, time
 
-# ─── Функции ──────────────────────────────────────────────────────────────────
+filepath  = sys.argv[1]
+total     = int(sys.argv[2]) if sys.argv[2].isdigit() else 0
+raw_name  = sys.argv[3]
+name      = (raw_name[:26] + "..") if len(raw_name) > 28 else raw_name
+bar_w     = 22
 
+def fmt(b):
+    if b >= 1024**3: return f"{b/1024**3:.1f}G"
+    if b >= 1024**2: return f"{b/1024**2:.0f}M"
+    return f"{b/1024:.0f}K"
+
+start = time.time()
+while True:
+    try:
+        cur = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+    except Exception:
+        cur = 0
+
+    elapsed = time.time() - start
+    speed   = cur / elapsed if elapsed > 0 else 0
+
+    if total > 0:
+        pct    = min(cur / total, 1.0)
+        filled = int(bar_w * pct)
+        bar    = "=" * filled + (">" if filled < bar_w else "") + " " * max(0, bar_w - filled - 1)
+        eta    = int((total - cur) / speed) if speed > 0 and cur < total else 0
+        eta_s  = f"eta {eta}s" if cur < total else "done"
+        print(f"     [{bar}] {pct*100:5.1f}%  {fmt(cur)}/{fmt(total)}  {fmt(int(speed))}/s  {eta_s}", flush=True)
+    else:
+        print(f"     {fmt(cur)} скачано  {fmt(int(speed))}/s", flush=True)
+
+    if not os.path.exists(filepath + ".tmp") and cur > 0 and cur == total:
+        break
+    # Проверяем завершение curl через sentinel
+    try:
+        os.kill(int(open('/tmp/_curl_pid').read()), 0)
+    except Exception:
+        time.sleep(0.5)
+        break
+    time.sleep(2)
+PYEOF
+
+    wait $curl_pid || { log_warn "Не удалось скачать: $url"; return 1; }
+    log_info "Сохранён: $filename"
+}
+
+# ─── Скачать список файлов в папку ────────────────────────────────────────────
 function provisioning_get_files() {
     if [[ $# -lt 2 ]]; then return; fi
     local dir="$1"
     shift
     local files=("$@")
 
-    mkdir -p "$dir"
-    echo -e "  ${BOLD}Папка:${RESET} $dir  (${#files[@]} файл(ов))"
+    echo -e "  ${BOLD}→ $dir${RESET}  (${#files[@]} файл(ов))"
 
     for url in "${files[@]}"; do
-        local filename
-        filename=$(basename "$url" | cut -d'?' -f1)
-
-        if [[ -f "$dir/$filename" ]]; then
-            log_skip "$filename"
-            continue
-        fi
-
-        log_dl "$filename"
-
-        local wget_args=(-q --content-disposition --show-progress
-                         --progress=bar:force:noscroll
-                         -e dotbytes=4M -P "$dir")
-
+        local auth=""
         if [[ -n "${HF_TOKEN:-}" && "$url" =~ huggingface\.co ]]; then
-            wget_args+=(--header="Authorization: Bearer $HF_TOKEN")
+            auth="Authorization: Bearer $HF_TOKEN"
         elif [[ -n "${CIVITAI_TOKEN:-}" && "$url" =~ civitai\.com ]]; then
-            wget_args+=(--header="Authorization: Bearer $CIVITAI_TOKEN")
+            auth="Authorization: Bearer $CIVITAI_TOKEN"
         fi
-
-        wget "${wget_args[@]}" "$url" 2>&1 \
-            || log_warn "Не удалось скачать: $url"
+        echo $$ > /tmp/_curl_pid
+        download_file "$url" "$dir" "$auth"
     done
 }
 
+# ─── Прочие функции ───────────────────────────────────────────────────────────
 function provisioning_clone_comfyui() {
     if [[ ! -d "${COMFYUI_DIR}" ]]; then
         log_info "Клонируем ComfyUI..."
@@ -129,33 +156,61 @@ function provisioning_install_base_reqs() {
 function provisioning_install_custom_nodes() {
     log_info "Скачиваем архив кастомных нодов..."
     cd "${WORKSPACE}"
-
-    wget -q --show-progress --progress=bar:force:noscroll \
-        ${HF_TOKEN:+--header="Authorization: Bearer $HF_TOKEN"} \
+    download_file \
         "https://huggingface.co/wissxi/Wan_2.2_Ki4ra/resolve/main/custom_nodes.zip" \
-        -O custom_nodes.zip 2>&1
-
+        "${WORKSPACE}" \
+        "${HF_TOKEN:+Authorization: Bearer $HF_TOKEN}"
     log_info "Распаковываем кастомные ноды..."
-    unzip -o -q custom_nodes.zip -d /
-    rm -f custom_nodes.zip
+    unzip -o -q "${WORKSPACE}/custom_nodes.zip" -d /
+    rm -f "${WORKSPACE}/custom_nodes.zip"
     log_info "Кастомные ноды установлены"
 }
 
 function provisioning_install_pip_requirements() {
     log_info "Скачиваем requirements.txt..."
     cd "${WORKSPACE}"
-
-    wget -q \
-        ${HF_TOKEN:+--header="Authorization: Bearer $HF_TOKEN"} \
+    curl -sL \
+        ${HF_TOKEN:+-H "Authorization: Bearer $HF_TOKEN"} \
         "https://huggingface.co/wissxi/Wan_2.2_Ki4ra/resolve/main/requirements.txt" \
-        -O requirements_custom.txt
-
+        -o requirements_custom.txt
     log_info "Устанавливаем pip-зависимости..."
     pip install --no-cache-dir --root-user-action=ignore -q -r requirements_custom.txt
     rm -f requirements_custom.txt
     log_info "Pip-зависимости установлены"
 }
 
+# ─── Модели ───────────────────────────────────────────────────────────────────
+CLIP_MODELS=(
+    "https://huggingface.co/f5aiteam/CLIP/resolve/main/umt5_xxl_fp8_e4m3fn_scaled.safetensors"
+)
+CLIP_VISION_MODELS=(
+    "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/clip_vision/clip_vision_h.safetensors"
+)
+VAE_MODELS=(
+    "https://huggingface.co/Comfy-Org/Wan_2.1_ComfyUI_repackaged/resolve/main/split_files/vae/wan_2.1_vae.safetensors"
+)
+DIFFUSION_MODELS=(
+    "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/diffusion_models/z_image_turbo_bf16.safetensors"
+    "https://huggingface.co/Tongyi-MAI/Z-Image/resolve/main/transformer/diffusion_pytorch_model-00001-of-00002.safetensors"
+    "https://huggingface.co/Kijai/WanVideo_comfy_fp8_scaled/resolve/main/Wan22Animate/Wan2_2-Animate-14B_fp8_scaled_e4m3fn_KJ_v2.safetensors"
+)
+DETECTION_MODELS=(
+    "https://huggingface.co/Wan-AI/Wan2.2-Animate-14B/resolve/main/process_checkpoint/det/yolov10m.onnx"
+    "https://huggingface.co/Kijai/vitpose_comfy/resolve/main/onnx/vitpose_h_wholebody_data.bin"
+    "https://huggingface.co/Kijai/vitpose_comfy/resolve/main/onnx/vitpose_h_wholebody_model.onnx"
+    "https://huggingface.co/wissxi/Wan_2.2_Ki4ra/resolve/main/models/detection/vitpose-l-wholebody.onnx"
+)
+LORA_MODELS=(
+    "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank256_bf16.safetensors"
+    "https://huggingface.co/Comfy-Org/Wan_2.2_ComfyUI_Repackaged/resolve/main/split_files/loras/wan2.2_i2v_lightx2v_4steps_lora_v1_high_noise.safetensors"
+    "https://huggingface.co/alibaba-pai/Wan2.2-Fun-Reward-LoRAs/resolve/main/Wan2.2-Fun-A14B-InP-low-noise-HPS2.1.safetensors"
+    "https://huggingface.co/Kijai/WanVideo_comfy/resolve/main/Pusa/Wan21_PusaV1_LoRA_14B_rank512_bf16.safetensors"
+)
+UPSCALER_MODELS=(
+    "https://huggingface.co/GerbyHorty76/videoloras/resolve/main/4xUltrasharp_4xUltrasharpV10.pt"
+)
+
+# ─── Основная функция ─────────────────────────────────────────────────────────
 function provisioning_start() {
     START_TIME=$(date +%s)
 
@@ -199,7 +254,6 @@ function provisioning_start() {
 }
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
-
 if [[ ! -f /.noprovisioning ]]; then
     provisioning_start
 fi
